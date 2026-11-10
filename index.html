@@ -1,0 +1,303 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#242424">
+<title>Tasks</title>
+<style>
+  :root { color-scheme: dark; background: #242424; color: #f2f2f2; font: 16px/1.5 Consolas, "SFMono-Regular", monospace; }
+  * { box-sizing: border-box; }
+  body { margin: 0; }
+  main { max-width: 66rem; padding: 1rem clamp(.75rem, 3vw, 2rem); }
+  header { display: flex; align-items: baseline; gap: 1rem; margin-bottom: .5rem; }
+  h1 { font: inherit; font-weight: bold; margin: 0; }
+  #status { font-size: .8rem; color: #c1c1c1; }
+  form, li { display: flex; align-items: baseline; gap: .55rem; }
+  input, button, textarea { font: inherit; color: inherit; }
+  input[type=text] { min-width: 0; flex: 1; background: #202020; border: 1px solid #555; padding: .45rem .55rem; border-radius: 3px; }
+  button { background: none; border: 1px solid #666; border-radius: 3px; padding: .4rem .55rem; cursor: pointer; }
+  :focus-visible { outline: 2px solid #aad6ff; outline-offset: 2px; }
+  ul { list-style: none; padding: 0; margin: .6rem 0 0; }
+  li { min-height: 34px; }
+  input[type=checkbox] { margin: 0; align-self: start; margin-top: .55rem; width: 1rem; height: 1rem; accent-color: #a5b9a6; cursor: pointer; }
+  .line { border: 0; flex: 1; min-width: 0; text-align: left; padding: .2rem 0; overflow-wrap: anywhere; white-space: pre-wrap; }
+  time { color: #abd5fb; }
+  .done .line, .done time { color: #a1a1a1; text-decoration: line-through; }
+  #list time[data-due-state="today"] { color: #ff8585; }
+  #list time[data-due-state="past"] { color: #f6d365; }
+  #add { max-width: 18rem; margin-top: .5rem; gap: .4rem; }
+  #entry { background: transparent; border: 0; border-bottom: 1px solid #666; border-radius: 0; padding: .2rem 0; }
+  #entry:focus-visible { outline: none; border-bottom-color: #aad6ff; }
+  textarea.line { background: transparent; border-radius: 0; resize: none; overflow: hidden; display: block; }
+  textarea.line:focus { outline: none; }
+  @media (pointer: coarse) {
+    li { min-height: 44px; }
+    input[type=checkbox] { width: 1.25rem; height: 1.25rem; }
+    button { min-height: 44px; }
+  }
+</style>
+<main>
+  <header><h1>Tasks</h1><span id="status" role="status">Loading...</span></header>
+  <ul id="list" aria-label="Tasks"></ul>
+  <form id="add">
+    <input id="entry" type="text" aria-label="New task" maxlength="1000" autocomplete="off" enterkeyhint="done" required>
+  </form>
+
+</main>
+<script>
+const form = document.querySelector('#add');
+const entry = document.querySelector('#entry');
+const list = document.querySelector('#list');
+const status = document.querySelector('#status');
+let tasks = [];
+let editing = null;
+let busy = false;
+let polling = false;
+let revision = 0;
+let addDraft;
+
+function dateParts(text, now = new Date()) {
+  const match = /(?:^|\s)(\d{1,2})\/(\d{1,2})(?:\/(\d{4}))?$/.exec(text);
+  if (!match) return null;
+  const [, monthText, dayText, yearText] = match;
+  const month = Number(monthText);
+  const day = Number(dayText);
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+  const firstYear = yearText ? Number(yearText) : now.getFullYear();
+  const lastYear = yearText ? firstYear : firstYear + 8;
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  for (let year = firstYear; year <= lastYear; year++) {
+    if (year < 1000) return null;
+    const date = new Date(year, month - 1, day);
+    if (date.getMonth() !== month - 1 || date.getDate() !== day) continue;
+    if (!yearText && date < today) continue;
+    return { iso: [year, String(month).padStart(2, '0'), String(day).padStart(2, '0')].join('-'), label: match[0].trim() };
+  }
+  return null;
+}
+
+async function api(method, data) {
+  const options = { method, cache: 'no-store' };
+  if (data) {
+    options.headers = { 'Content-Type': 'application/json' };
+    options.body = JSON.stringify(data);
+  }
+  const response = await fetch('/api/tasks', options);
+  if (!response.ok) throw new Error('Task request failed');
+  return response.json();
+}
+
+function localDateKey(date = new Date()) {
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return [date.getFullYear(), month, day].join('-');
+}
+
+function updateDueColors() {
+  const today = localDateKey();
+  for (const time of list.querySelectorAll('time')) {
+    const state = time.dateTime === today ? 'today' : time.dateTime < today ? 'past' : 'future';
+    if (time.dataset.dueState === state) continue;
+    time.dataset.dueState = state;
+    const date = new Date(time.dateTime + 'T00:00:00').toLocaleDateString(undefined, { dateStyle: 'long' });
+    const label = { today: 'Due today', past: 'Overdue', future: 'Due' }[state];
+    time.setAttribute('aria-label', label + ', ' + date);
+  }
+}
+
+function render() {
+  list.replaceChildren();
+  for (const task of tasks) {
+    const row = document.createElement('li');
+    if (task.done) row.className = 'done';
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.checked = Boolean(task.done);
+    checkbox.setAttribute('aria-label', task.text);
+    checkbox.onchange = async () => {
+      if (editing) { checkbox.checked = Boolean(task.done); return; }
+      const done = checkbox.checked;
+      if (!await change('PATCH', { id: task.id, done }, () => { task.done = done; })) {
+        checkbox.checked = Boolean(task.done);
+      }
+      list.querySelector('[data-id="' + task.id + '"] input')?.focus();
+    };
+    row.dataset.id = task.id;
+    row.append(checkbox, line(task));
+    list.append(row);
+  }
+  updateDueColors();
+}
+
+function line(task) {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'line';
+  const suffix = /\d{1,2}\/\d{1,2}(?:\/\d{4})?$/.exec(task.text);
+  if (task.due && suffix) {
+    const time = document.createElement('time');
+    time.dateTime = task.due;
+    time.textContent = suffix[0];
+    button.append(task.text.slice(0, suffix.index), time);
+  } else {
+    button.textContent = task.text;
+  }
+  button.onclick = () => {
+    if (busy || editing) return;
+    editing = task.id;
+    const edit = editor(task);
+    button.replaceWith(edit);
+    edit.style.height = 'auto';
+    edit.style.height = edit.scrollHeight + 'px';
+    edit.focus();
+    edit.setSelectionRange(edit.value.length, edit.value.length);
+  };
+  return button;
+}
+
+function editor(task) {
+  const input = document.createElement('textarea');
+  input.className = 'line';
+  input.rows = 1;
+  input.maxLength = 1000;
+  input.value = task.text;
+  input.enterKeyHint = 'done';
+  input.setAttribute('aria-label', 'Edit task');
+  input.oninput = () => {
+    input.style.height = 'auto';
+    input.style.height = input.scrollHeight + 'px';
+  };
+
+  function close(restoreFocus) {
+    editing = null;
+    const button = line(task);
+    input.replaceWith(button);
+    updateDueColors();
+    if (restoreFocus) button.focus();
+  }
+
+  async function save(restoreFocus, deleteKey) {
+    if (busy || editing !== task.id) return;
+    const text = input.value.trim().replace(/\s*\r?\n\s*/g, ' ');
+    if (text === task.text) {
+      close(restoreFocus);
+      return;
+    }
+    input.readOnly = true;
+    const { id } = task;
+    if (!text) {
+      const row = input.closest('li');
+      const previous = row.previousElementSibling?.querySelector('.line');
+      const next = row.nextElementSibling?.querySelector('.line') ?? entry;
+      const saved = await change('DELETE', { id }, () => {
+        tasks = tasks.filter(item => item.id !== id);
+      });
+      if (saved) {
+        editing = null;
+        row.remove();
+        if (deleteKey && previous) {
+          previous.click();
+          if (deleteKey === 'Delete') {
+            const editor = document.activeElement;
+            if (editor instanceof HTMLTextAreaElement) editor.setSelectionRange(0, 0);
+          }
+        } else if (restoreFocus) {
+          next.focus();
+        }
+      } else {
+        input.readOnly = false;
+      }
+      return;
+    }
+
+    const parsed = dateParts(text);
+    const due = parsed?.label === dateParts(task.text)?.label ? task.due : parsed?.iso ?? null;
+    const saved = await change('PATCH', { id, text, due }, () => {
+      Object.assign(task, { text, due });
+    });
+    if (saved) {
+      input.closest('li').querySelector('input').setAttribute('aria-label', text);
+      close(restoreFocus);
+    } else {
+      input.readOnly = false;
+    }
+  }
+
+  input.onblur = () => save(false);
+  input.onkeydown = event => {
+    if (event.isComposing) return;
+    if ((event.key === 'Backspace' || event.key === 'Delete') && !input.value.trim()) {
+      event.preventDefault();
+      save(true, event.key);
+    } else if (event.key === 'Enter') {
+      event.preventDefault();
+      save(true);
+    } else if (event.key === 'Escape' && !busy) {
+      event.preventDefault();
+      close(true);
+    }
+  };
+  return input;
+}
+
+
+async function refresh() {
+  updateDueColors();
+  if (busy || editing || polling || document.hidden) return;
+  polling = true;
+  const snapshot = revision;
+  try {
+    const incoming = await api('GET');
+    if (busy || editing || snapshot !== revision) return;
+    if (JSON.stringify(tasks) !== JSON.stringify(incoming)) {
+      tasks = incoming;
+      render();
+    }
+    status.textContent = '';
+  } catch {
+    if (!busy && snapshot === revision) status.textContent = 'Could not sync. Retrying...';
+  } finally {
+    polling = false;
+  }
+}
+
+async function change(method, data, apply) {
+  if (busy) return false;
+  revision++;
+  busy = true;
+  try {
+    await api(method, data);
+    apply();
+    if (!editing) render();
+    status.textContent = '';
+    return true;
+  } catch {
+    status.textContent = 'Change could not be saved. Try again.';
+    return false;
+  } finally {
+    busy = false;
+  }
+}
+
+form.onsubmit = async event => {
+  event.preventDefault();
+  const text = entry.value.trim();
+  if (!text || busy || editing) return;
+  if (addDraft?.text !== text) {
+    addDraft = { id: crypto.randomUUID(), text, due: dateParts(text)?.iso ?? null };
+  }
+  const task = addDraft;
+  if (await change('POST', task, () => {
+    if (!tasks.some(item => item.id === task.id)) tasks.push({ ...task, done: 0 });
+    if (entry.value.trim() === text) entry.value = '';
+    addDraft = undefined;
+  })) entry.focus();
+};
+
+refresh();
+setInterval(refresh, 4000);
+document.addEventListener('visibilitychange', refresh);
+</script>
+</html>
+
+

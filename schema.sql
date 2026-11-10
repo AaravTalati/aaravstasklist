@@ -1,0 +1,10 @@
+CREATE TABLE IF NOT EXISTS tasks (
+  position INTEGER PRIMARY KEY AUTOINCREMENT,
+  owner TEXT NOT NULL,
+  id TEXT NOT NULL,
+  text TEXT NOT NULL,
+  due TEXT,
+  done INTEGER NOT NULL DEFAULT 0,
+  UNIQUE (owner, id)
+);
+
